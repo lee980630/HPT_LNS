@@ -7,6 +7,7 @@ import torch.distributed
 from torch.distributed.device_mesh import init_device_mesh
 import verl.utils.hdfs_io as hdfs_io
 import verl.utils.torch_functional as verl_F
+from transformers import AutoModelForCausalLM, AutoConfig, AutoModelForVision2Seq # [수정] AutoModelForVision2Seq 추가
 from omegaconf import DictConfig, open_dict
 from verl import DataProto
 from verl.single_controller.base import Worker
@@ -131,6 +132,16 @@ class MIXActorRolloutRefWorker(Worker):
 
         # override model kwargs
         actor_model_config = AutoConfig.from_pretrained(local_path, trust_remote_code=trust_remote_code)
+        # ==================================================================
+        # [추가] vLLM 호환성을 위해 rope_scaling에 factor 강제 주입
+        # ==================================================================
+        if hasattr(actor_model_config, "rope_scaling") and actor_model_config.rope_scaling:
+            if "factor" not in actor_model_config.rope_scaling:
+                print(f"🔧 [HPT] Injecting 'factor: 1.0' into rope_scaling for vLLM compatibility.")
+                actor_model_config.rope_scaling["factor"] = 1.0
+        # ==================================================================
+
+
 
         if use_remove_padding:
             from verl.models.registry import check_model_support_rmpad
@@ -153,13 +164,27 @@ class MIXActorRolloutRefWorker(Worker):
         # NOTE(fix me): tie_word_embedding causes meta_tensor init to hang
         init_context = get_init_weight_context_manager(use_meta_tensor=not actor_model_config.tie_word_embeddings)
 
+        # with init_context(), warnings.catch_warnings():
+        #     warnings.simplefilter("ignore")
+        #     actor_module = AutoModelForCausalLM.from_pretrained(pretrained_model_name_or_path=local_path,
+        #                                                         torch_dtype=torch_dtype,
+        #                                                         config=actor_model_config,
+        #                                                         attn_implementation='flash_attention_2',
+        #                                                         trust_remote_code=trust_remote_code)
+        #수정
         with init_context(), warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            actor_module = AutoModelForCausalLM.from_pretrained(pretrained_model_name_or_path=local_path,
-                                                                torch_dtype=torch_dtype,
-                                                                config=actor_model_config,
-                                                                attn_implementation='flash_attention_2',
-                                                                trust_remote_code=trust_remote_code)
+            actor_module = AutoModelForVision2Seq.from_pretrained(
+                pretrained_model_name_or_path=local_path,
+                torch_dtype=torch_dtype,
+                config=actor_model_config,
+                attn_implementation='flash_attention_2',
+                trust_remote_code=trust_remote_code
+            )
+
+            actor_model_config._name_or_path = local_path
+            actor_module.config._name_or_path = local_path
+            #//
             # some parameters may not in torch_dtype. TODO(zhangchi.usc1992) remove this after we switch to fsdp2
             actor_module.to(torch_dtype)
             # if self._is_actor and self.config.actor.use_adaptive_temperature is True:
@@ -226,11 +251,37 @@ class MIXActorRolloutRefWorker(Worker):
         # TODO: add more optimizer args into config
         if role == 'actor':
             from verl.utils.torch_functional import get_constant_schedule_with_warmup
-            actor_optimizer = optim.AdamW(actor_module_fsdp.parameters(),
-                                          lr=optim_config.lr,
-                                          betas=optim_config.get('betas', (0.9, 0.999)),
-                                          weight_decay=optim_config.get('weight_decay', 1e-2))
+            #수정 adam8
+            # actor_optimizer = optim.AdamW(actor_module_fsdp.parameters(),
+            #                               lr=optim_config.lr,
+            #                               betas=optim_config.get('betas', (0.9, 0.999)),
+            #                               weight_decay=optim_config.get('weight_decay', 1e-2))
 
+            optim_name = optim_config.get('name', 'adamw')
+            if optim_name == 'adamw_8bit':
+                import importlib.util
+
+                if importlib.util.find_spec('bitsandbytes') is None:
+                    print("bitsandbytes not installed. Falling back to regular AdamW.")
+                    actor_optimizer = optim.AdamW(actor_module_fsdp.parameters(),
+                                                  lr=optim_config.lr,
+                                                  betas=optim_config.get('betas', (0.9, 0.999)),
+                                                  weight_decay=optim_config.get('weight_decay', 1e-2))
+                else:
+                    import bitsandbytes.optim as bnb_optim
+
+                    print("Using 8-bit AdamW optimizer.")
+                    actor_optimizer = bnb_optim.AdamW8bit(
+                        actor_module_fsdp.parameters(),
+                        lr=optim_config.lr,
+                        betas=optim_config.get('betas', (0.9, 0.999)),
+                        weight_decay=optim_config.get('weight_decay', 1e-2))
+            else:
+                actor_optimizer = optim.AdamW(actor_module_fsdp.parameters(),
+                                              lr=optim_config.lr,
+                                              betas=optim_config.get('betas', (0.9, 0.999)),
+                                              weight_decay=optim_config.get('weight_decay', 1e-2))
+            #//            
             total_steps = optim_config.get('total_training_steps', 0)
             num_warmup_steps_ratio = optim_config.get('lr_warmup_steps_ratio', 0.)
             num_warmup_steps = int(num_warmup_steps_ratio * total_steps)

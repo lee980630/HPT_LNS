@@ -36,6 +36,15 @@ from verl.single_controller.ray import RayResourcePool, RayWorkerGroup, RayClass
 from verl.single_controller.ray.base import create_colocated_worker_cls
 from verl.trainer.ppo import core_algos
 from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seqlen_unbalance
+#수정 추가 
+import re
+from .vrag_agent.generation_phase1 import LLMGenerationManager, GenerationConfig
+# GPU 모니터링이 필요하다면 추가 (ray_trainer.py 참고)
+import sys
+sys.path.append('.') 
+from .vrag_agent.gpu_monitor import GPUMonitor
+from datetime import datetime
+#//
 
 import torch
 
@@ -207,7 +216,8 @@ class MIXRayPPOTrainer(RayPPOTrainer):
                  resource_pool_manager: ResourcePoolManager,
                  ray_worker_group_cls: RayWorkerGroup = RayWorkerGroup,
                  reward_fn=None,
-                 val_reward_fn=None):
+                 val_reward_fn=None,
+                 processor=None):
 
         # assert torch.cuda.is_available(), 'cuda must be available on driver'
 
@@ -215,6 +225,7 @@ class MIXRayPPOTrainer(RayPPOTrainer):
         self.config = config
         self.reward_fn = reward_fn
         self.val_reward_fn = val_reward_fn
+        self.processor = processor # [추가] self.processor 저장
 
         self.hybrid_engine = config.actor_rollout_ref.hybrid_engine
         assert self.hybrid_engine, 'Currently, only support hybrid engine'
@@ -450,6 +461,23 @@ class MIXRayPPOTrainer(RayPPOTrainer):
 
         if self.config.trainer.remove_sfted_data:
             sfted_data_item_list = []
+
+        # [추가 1] Generation Manager 초기화 (Loop 시작 전에 한 번만)
+        # config에서 필요한 값들을 가져와 GenerationConfig 생성
+        gen_config = GenerationConfig(
+            max_turns=self.config.actor_rollout_ref.rollout.get('max_turns', 5),
+            max_prompt_length=self.config.actor_rollout_ref.rollout.max_prompt_length, # 또는 99999
+            num_gpus=self.config.trainer.n_gpus_per_node,
+            search_url=self.config.get('retriever', {}).get('url', None),
+            # 필요한 경우 crops_dir 등 추가 설정
+        )
+
+        generation_manager = LLMGenerationManager(
+            processor=self.processor, # self.processor가 없다면 __init__에서 받아오도록 수정 필요 (아래 참고)
+            actor_rollout_wg=self.actor_rollout_wg,
+            config=gen_config,
+        )
+        #//
         
         for _ in range(self.config.trainer.total_epochs):
 
@@ -480,33 +508,95 @@ class MIXRayPPOTrainer(RayPPOTrainer):
                 check_memory_usage("batch_start")
                 
                 batch: DataProto = DataProto.from_single_dict(batch_dict)
+                # ===========================================================
+                # [수정] Parquet의 'index'를 RAG가 사용하는 'id'와 'uid'로 매핑
+                # ===========================================================
+                if 'index' in batch.non_tensor_batch:
+                    # 1. 'index' 값을 가져옵니다.
+                    indices = batch.non_tensor_batch['index']
+                    
+                    # 2. RAG Manager가 사용하는 'id' 키에 할당합니다.
+                    batch.non_tensor_batch['id'] = indices
+                    
+                    # 3. HPT 내부 로직(reward 계산 등)에서 사용하는 'uid'에도 할당합니다.
+                    #    (기존에는 랜덤 UUID를 썼지만, 일관성을 위해 index 사용)
+                    batch.non_tensor_batch['uid'] = indices
+                else:
+                    # 만약 index가 없는 경우를 대비한 예외 처리 (랜덤 UUID)
+                    print("Warning: 'index' not found in batch. Using random UUIDs.")
+                    uids = np.array([str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object)
+                    batch.non_tensor_batch['id'] = uids
+                    batch.non_tensor_batch['uid'] = uids
+                # ===========================================================
 
                 metrics = {}
                 timing_raw = {}
 
-                if self.config.trainer.unify_strategy != 'no' and self.config.trainer.unify_strategy != 'soft':
-                    # Before popping, copy the required data first
-                    batch.batch['raw_input_ids'] = batch.batch['input_ids'].clone()
-                    batch.batch['raw_attention_mask'] = batch.batch['attention_mask'].clone()
-                    batch.batch['raw_position_ids'] = batch.batch['position_ids'].clone()
+                #수정
+                # if self.config.trainer.unify_strategy != 'no' and self.config.trainer.unify_strategy != 'soft':
+                #     # Before popping, copy the required data first
+                #     batch.batch['raw_input_ids'] = batch.batch['input_ids'].clone()
+                #     batch.batch['raw_attention_mask'] = batch.batch['attention_mask'].clone()
+                #     batch.batch['raw_position_ids'] = batch.batch['position_ids'].clone()
                     
-                    # pop those keys for generation
-                    gen_batch = batch.pop(batch_keys=['input_ids', 'attention_mask', 'position_ids'])
+                #     # pop those keys for generation
+                #     gen_batch = batch.pop(batch_keys=['input_ids', 'attention_mask', 'position_ids'])
+                # else:
+                #     gen_batch = batch.pop(batch_keys=['input_ids', 'attention_mask', 'position_ids', 'tgt_input_ids'])
+                # gen_batch.meta_info['global_steps'] = self.global_steps
+                if self.config.trainer.unify_strategy != 'no' and self.config.trainer.unify_strategy != 'soft':
+                     # RAG는 보통 n_agent만큼 반복해서 생성하므로 repeat_deepcopy 사용 (ray_trainer.py 참고)
+                     gen_batch = batch.repeat_deepcopy(repeat_times=self.config.actor_rollout_ref.rollout.n_verify, interleave=True)
+
+                     # ▼▼▼ [디버깅 추가] 실제 키 확인 ▼▼▼
+                     print(f"\n🔍 [HPT Debug] Checking keys in gen_batch.non_tensor_batch:")
+                     print(f"   -> Keys found: {list(gen_batch.non_tensor_batch.keys())}")
+                     # ▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲
+                     
+                     # [cite_start]필요한 키 pop (ray_trainer.py [cite: 797-804] 참고)
+                     if 'multi_modal_inputs' in gen_batch.non_tensor_batch.keys():
+                        gen_batch = gen_batch.pop(
+                            batch_keys=['input_ids', 'attention_mask', 'position_ids'],
+                            non_tensor_batch_keys=['id','raw_prompt_ids', 'multi_modal_data', 'multi_modal_inputs'],
+                        )
+                     else:
+                        # 텍스트 전용일 경우
+                        gen_batch = gen_batch.pop(
+                            batch_keys=['input_ids', 'attention_mask', 'position_ids'],
+                             non_tensor_batch_keys=['id','raw_prompt_ids'] # id, raw_prompt_ids 필요
+                        )
                 else:
+                    # 기존 로직 (필요시 유지)
                     gen_batch = batch.pop(batch_keys=['input_ids', 'attention_mask', 'position_ids', 'tgt_input_ids'])
-                gen_batch.meta_info['global_steps'] = self.global_steps
+                #-----------------------------------
 
                 with _timer('step', timing_raw):
                     # generate a batch
                     with _timer('gen', timing_raw):
                         if self.config.trainer.unify_strategy != 'no' and self.config.trainer.unify_strategy != 'soft':
-                            gen_batch_output = self.actor_rollout_wg.generate_on_sequences(gen_batch, on_num=self.config.actor_rollout_ref.rollout.n_verify)
+                            #gen_batch_output = self.actor_rollout_wg.generate_on_sequences(gen_batch, on_num=self.config.actor_rollout_ref.rollout.n_verify)
+                            # RAG 롤아웃을 위한 초기 입력 준비
+                            first_input_ids = gen_batch.batch['input_ids'].clone().long()
+                            
+                            # GenerationManager에 타이밍 기록 객체 전달
+                            generation_manager.timing_raw = timing_raw
+                            
+                            # AIna님의 멀티턴 RAG 루프 실행!
+                            gen_batch_output = generation_manager.run_llm_loop(
+                                gen_batch=gen_batch,
+                                initial_input_ids=first_input_ids,
+                            )
+                            
+                            # 데이터 타입 보정 (DataProto 호환성)
+                            for key in gen_batch_output.batch.keys():
+                                gen_batch_output.batch[key] = gen_batch_output.batch[key].long()
+                            # [교체된 부분 끝] ----------------------------------------------
                         else:
                             gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
                     
                     # This code matches a prompt ID with its N responses.
-                    batch.non_tensor_batch['uid'] = np.array([str(uuid.uuid4()) for _ in range(len(batch.batch))],
-                                                             dtype=object)
+                    # batch.non_tensor_batch['uid'] = np.array([str(uuid.uuid4()) for _ in range(len(batch.batch))],
+                    #                                          dtype=object)
                     
                     if self.config.trainer.unify_strategy != 'no' and self.config.trainer.unify_strategy != 'soft':
                         batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n_verify, interleave=True)
@@ -568,6 +658,12 @@ class MIXRayPPOTrainer(RayPPOTrainer):
                             fail_value = 0
                             success_value = 1
                             format_value = -1
+                        # [수정 추가] RAG Reward (Version 7) 설정
+                        elif self.config.data.reward_impl_version == 7:
+                            fail_value = 0
+                            success_value = 1 # 상징적인 값 (실제 판별은 아래 로직에서 수행)
+                            format_value = -1
+
                         else:
                             raise ValueError(f'Invalid reward implementation version: {self.config.data.reward_impl_version}')
                         
@@ -577,13 +673,22 @@ class MIXRayPPOTrainer(RayPPOTrainer):
                         for uid in unique_uids:
                             uid_mask = uids == uid
                             uid_rewards = reward_tensor[uid_mask].sum(-1)  # Sum rewards for each sequence
-                            
-                            # Check if all rewards are 0 or all are 1 for this uid
-                            if (uid_rewards == fail_value).all():
+                            if self.config.data.reward_impl_version == 7:
+                                # 0.1점(Format만 통과) 이하는 실패, 0.1점 초과(검색 성공)는 성공
+                                is_solved = (uid_rewards > 0.1)
+                                is_failed = (uid_rewards <= 0.1)
+                                is_format_fail = (uid_rewards == 0.0) # 혹은 format_value 사용
+                            else:
+                                # 기존 로직 (정확히 success_value와 같아야 성공)
+                                is_solved = (uid_rewards == success_value)
+                                is_failed = (uid_rewards == fail_value)
+                                is_format_fail = (uid_rewards == format_value)
+
+                            if is_failed.all():
                                 solve_none += 1
-                            elif (uid_rewards == success_value).all():
+                            elif is_solved.all():
                                 solve_all += 1
-                            elif (uid_rewards == format_value).all():
+                            elif is_format_fail.all():
                                 solve_none_format += 1
 
                         # Log to metrics
@@ -591,9 +696,21 @@ class MIXRayPPOTrainer(RayPPOTrainer):
                         metrics['batch/solve_none_format'] = solve_none_format
                         metrics['batch/solve_all'] = solve_all
 
+                        #수정
                         # add more metrics
-                        metrics['batch/solved'] = (reward_tensor.sum(-1) == success_value).sum().item() / len(uids)
-                        metrics['batch/failed'] = (reward_tensor.sum(-1) == fail_value).sum().item() / len(uids)
+                        # metrics['batch/solved'] = (reward_tensor.sum(-1) == success_value).sum().item() / len(uids)
+                        # metrics['batch/failed'] = (reward_tensor.sum(-1) == fail_value).sum().item() / len(uids)
+                        seq_scores = reward_tensor.sum(-1)
+
+                        if self.config.data.reward_impl_version == 7:
+                            # RAG: 0.1점 초과면 성공, 이하면 실패
+                            metrics['batch/solved'] = (seq_scores > 0.1).sum().item() / len(uids)
+                            metrics['batch/failed'] = (seq_scores <= 0.1).sum().item() / len(uids)
+                        else:
+                            # 기존: 정확히 1.0이면 성공, 0.0이면 실패
+                            metrics['batch/solved'] = (seq_scores == success_value).sum().item() / len(uids)
+                            metrics['batch/failed'] = (seq_scores == fail_value).sum().item() / len(uids)
+                        #------------------------------
 
                         
                         if self.config.trainer.unify_strategy != 'no' and self.config.trainer.unify_strategy != 'soft':
@@ -605,10 +722,21 @@ class MIXRayPPOTrainer(RayPPOTrainer):
                             for uid in unique_uids:
                                 uid_mask = uids == uid
                                 uid_rewards = reward_tensor[uid_mask].sum(-1)
-                                # Count on_solve_num for this uid
-                                on_solve_num = (uid_rewards == success_value).sum().item()
+
+                                # [핵심 수정] HPT 스위칭을 위한 성공 횟수 카운트
+                                if self.config.data.reward_impl_version == 7:
+                                    # "0.1점 초과"인 경우만 성공으로 카운트 -> RL 모드 진입
+                                    on_solve_num = (uid_rewards > 0.1).sum().item()
+                                else:
+                                    # 기존 로직
+                                    on_solve_num = (uid_rewards == success_value).sum().item()
+
                                 on_remove_num, on_add_num, off_add_num = self.select_on_off_ada_balance(on_solve_num)
 
+                                # # Count on_solve_num for this uid
+                                # on_solve_num = (uid_rewards == success_value).sum().item()
+                                # on_remove_num, on_add_num, off_add_num = self.select_on_off_ada_balance(on_solve_num)
+                                #----------------------------------------------------------------------------
                                 uid_balance[uid] = (on_remove_num, on_add_num, off_add_num)
 
                                 uid_indices = np.where(uid_mask)[0]

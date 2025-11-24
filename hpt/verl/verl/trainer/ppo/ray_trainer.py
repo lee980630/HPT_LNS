@@ -442,60 +442,100 @@ class RayPPOTrainer(object):
             self.config.critic.optim.total_training_steps = total_training_steps
 
     def _validate(self):
-        reward_tensor_lst = []
-        data_source_lst = []
-        for test_data in self.val_dataloader:
-            test_batch = DataProto.from_single_dict(test_data)
-            # test_batch = test_batch.to('cuda')
+            #-----------------수정-------------------
+            import torch
+            import numpy as np # numpy 임포트 확인 필요
+            
+            # [수정 1] 변수명 통일 (ndcg_list_all, recall_list_all로 초기화)
+            ndcg_list_all = [] 
+            recall_list_all = []
+            #---------------------------------------
+            reward_tensor_lst = []
+            data_source_lst = []
+            
+            for test_data in self.val_dataloader:
+                test_batch = DataProto.from_single_dict(test_data)
+                # test_batch = test_batch.to('cuda')
 
-            # we only do validation on rule-based rm
-            if self.config.reward_model.enable and test_batch[0].non_tensor_batch['reward_model']['style'] == 'model':
-                return {}
+                # we only do validation on rule-based rm
+                if self.config.reward_model.enable and test_batch[0].non_tensor_batch['reward_model']['style'] == 'model':
+                    return {}
 
-            n_val_samples = self.config.actor_rollout_ref.rollout.n_val
-            test_batch = test_batch.repeat(repeat_times=n_val_samples, interleave=True)
-            test_gen_batch = test_batch.pop(['input_ids', 'attention_mask', 'position_ids'])
-            test_gen_batch.meta_info = {
-                'eos_token_id': self.tokenizer.eos_token_id,
-                'pad_token_id': self.tokenizer.pad_token_id,
-                'recompute_log_prob': False,
-                'do_sample': False,
-                'validate': True,
-            }
+                n_val_samples = self.config.actor_rollout_ref.rollout.n_val
+                test_batch = test_batch.repeat(repeat_times=n_val_samples, interleave=True)
+                test_gen_batch = test_batch.pop(['input_ids', 'attention_mask', 'position_ids'])
+                test_gen_batch.meta_info = {
+                    'eos_token_id': self.tokenizer.eos_token_id,
+                    'pad_token_id': self.tokenizer.pad_token_id,
+                    'recompute_log_prob': False,
+                    'do_sample': False,
+                    'validate': True,
+                }
 
-            # pad to be divisible by dp_size
-            test_gen_batch_padded, pad_size = pad_dataproto_to_divisor(test_gen_batch, self.actor_rollout_wg.world_size)
-            test_gen_batch_padded.meta_info['val_temperature'] = self.config.actor_rollout_ref.rollout.val_temperature
-            test_gen_batch_padded.meta_info['val_top_p'] = self.config.actor_rollout_ref.rollout.val_top_p
-            test_output_gen_batch_padded = self.actor_rollout_wg.generate_sequences(test_gen_batch_padded)
-            # unpad
-            test_output_gen_batch = unpad_dataproto(test_output_gen_batch_padded, pad_size=pad_size)
-            print('Validation: Generation end.')
+                # pad to be divisible by dp_size
+                test_gen_batch_padded, pad_size = pad_dataproto_to_divisor(test_gen_batch, self.actor_rollout_wg.world_size)
+                test_gen_batch_padded.meta_info['val_temperature'] = self.config.actor_rollout_ref.rollout.val_temperature
+                test_gen_batch_padded.meta_info['val_top_p'] = self.config.actor_rollout_ref.rollout.val_top_p
+                test_output_gen_batch_padded = self.actor_rollout_wg.generate_sequences(test_gen_batch_padded)
+                # unpad
+                test_output_gen_batch = unpad_dataproto(test_output_gen_batch_padded, pad_size=pad_size)
+                print('Validation: Generation end.')
 
-            test_batch = test_batch.union(test_output_gen_batch)
+                test_batch = test_batch.union(test_output_gen_batch)
 
-            # evaluate using reward_function
-            # for certain reward function (e.g. sandbox), the generation can overlap with reward
-            reward_tensor = self.val_reward_fn(test_batch)
+                # evaluate using reward_function
+                #---------------------------------------------------------------------------
+                
+                # [수정 2] 3개의 값을 명시적으로 언패킹합니다.
+                reward_tensor, ndcg_list, recall_list = self.val_reward_fn(test_batch)
 
-            reward_tensor_lst.append(reward_tensor)
-            data_source_lst.append(test_batch.non_tensor_batch.get('data_source', ['unknown'] * reward_tensor.shape[0]))
+                # [수정 3] 리스트를 개별적으로 append/extend 합니다.
+                reward_tensor_lst.append(reward_tensor)
+                
+                # 위에서 초기화한 변수명(ndcg_list_all)을 사용합니다.
+                ndcg_list_all.extend(ndcg_list)  
+                recall_list_all.extend(recall_list)
 
-        reward_tensor = torch.cat(reward_tensor_lst, dim=0).sum(-1).cpu()  # (batch_size,)
-        data_sources = np.concatenate(data_source_lst, axis=0)
-        # evaluate test_score based on data source
-        data_source_reward = {}
-        for i in range(reward_tensor.shape[0]):
-            data_source = data_sources[i]
-            if data_source not in data_source_reward:
-                data_source_reward[data_source] = []
-            data_source_reward[data_source].append(reward_tensor[i].item())
+                # data_source 리스트 추가는 reward_tensor의 shape[0]을 기준으로 합니다.
+                data_source_lst.append(test_batch.non_tensor_batch.get('data_source', ['unknown'] * reward_tensor.shape[0]))
+            
+            #--------------------------------------------------------------
 
-        metric_dict = {}
-        for data_source, rewards in data_source_reward.items():
-            metric_dict[f'val/test_score/{data_source}'] = np.mean(rewards)
+            # 1. 모든 reward_tensor를 합치고 시퀀스 길이 방향으로 합산합니다.
+            reward_tensor_cat = torch.cat(reward_tensor_lst, dim=0).cpu() # [Total_B, Seq_L]
+            reward_tensor_summed = reward_tensor_cat.sum(-1) # [Total_B]
 
-        return metric_dict
+            data_sources = np.concatenate(data_source_lst, axis=0)
+            
+            # 2. 최종 메트릭 딕셔너리 계산
+            metric_dict = {}
+
+            # [추가] 최종 평균 NDCG 및 Recall 계산 (빈 리스트일 경우 대비 로직 추가 가능하지만, 여기선 바로 계산)
+            if ndcg_list_all:
+                metric_dict['val/ndcg/overall'] = np.mean(ndcg_list_all)
+            else:
+                metric_dict['val/ndcg/overall'] = 0.0
+                
+            if recall_list_all:
+                metric_dict['val/recall/overall'] = np.mean(recall_list_all)
+            else:
+                metric_dict['val/recall/overall'] = 0.0
+
+            # 3. data_source별 reward 평균 계산 (기존 PPO 로직)
+            data_source_reward = {}
+            for i in range(reward_tensor_summed.shape[0]):
+                data_source = data_sources[i]
+                if data_source not in data_source_reward:
+                    data_source_reward[data_source] = []
+                data_source_reward[data_source].append(reward_tensor_summed[i].item())
+
+            for data_source, rewards in data_source_reward.items():
+                metric_dict[f'val/test_score/{data_source}'] = np.mean(rewards)
+            
+            # 전체 평균 점수도 추가 (선택 사항)
+            metric_dict['val/test_score/overall'] = reward_tensor_summed.mean().item()
+
+            return metric_dict
 
     def init_workers(self):
         """Init resource pool and worker group"""

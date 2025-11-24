@@ -20,6 +20,7 @@ tensorflow/my_graph/*
 *.so
 
 # Distribution / packaging
+**/qwen-sft
 .Python
 env/
 build/
@@ -37,6 +38,7 @@ tmp/
 *.egg-info/
 .installed.cfg
 *.egg
+*.jpg
 
 # PyInstaller
 #  Usually these files are written by a python script from a template

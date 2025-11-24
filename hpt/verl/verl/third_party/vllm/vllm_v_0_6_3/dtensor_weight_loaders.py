@@ -186,42 +186,204 @@ def qwen2_dtensor_weight_loader(actor_weights: Dict, vllm_model: nn.Module) -> n
             weight_loader = getattr(param, "weight_loader", default_weight_loader)
             weight_loader(param, local_loaded_weight.to(dtype=param.dtype))
 
-
 def qwen2vl_dtensor_weight_loader(actor_weights: Dict, vllm_model: nn.Module) -> nn.Module:
+    sanitized_weights = {}
+
+    # ======== Preprocessing stage: rename checkpoint keys to match vLLM ========
+    for name, weight in actor_weights.items():
+        new_name = name
+
+        # prefix normalization
+        if new_name.startswith("model.visual."):
+            new_name = new_name.replace("model.visual.", "visual.")
+        elif new_name.startswith("model."):
+            new_name = new_name.replace("model.", "")
+
+        # Vision MLP mapping
+        if "visual.blocks" in new_name:
+
+            # 🔥 gate_proj -> fc1
+            if "mlp.gate_proj" in new_name:
+                mapped = new_name.replace("mlp.gate_proj", "mlp.fc1")
+                new_name = mapped
+
+            # 🔥 up_proj -> fc1
+            if "mlp.up_proj" in new_name:
+                mapped = new_name.replace("mlp.up_proj", "mlp.fc1")
+                new_name = mapped
+
+            # 🔥 down_proj -> fc2
+            if "mlp.down_proj" in new_name:
+                mapped = new_name.replace("mlp.down_proj", "mlp.fc2")
+                new_name = mapped
+
+        sanitized_weights[new_name] = weight
+
+    actor_weights = sanitized_weights
+    # ===========================================================================
+
     stacked_params_mapping = [
-        # (param_name, shard_name, shard_id)
         ("qkv_proj", "q_proj", "q"),
         ("qkv_proj", "k_proj", "k"),
         ("qkv_proj", "v_proj", "v"),
         ("gate_up_proj", "gate_proj", 0),
         ("gate_up_proj", "up_proj", 1),
     ]
+
     params_dict = dict(vllm_model.named_parameters(remove_duplicate=False))
+
+    # ========== Main weight loading ==============
     for name, loaded_weight in actor_weights.items():
+
         if "rotary_emb.inv_freq" in name:
             continue
         if vllm_model.config.tie_word_embeddings and "lm_head.weight" in name:
             continue
+
+        # ▼▼▼ [통합 수정] 이름표 전처리 (Preprocessing) ▼▼▼
+        # Qwen2-VL 체크포인트의 'language_' 접두사를 vLLM 표준인 'model.'로 변환
+        
+        # 1. 임베딩 레이어 처리
+        if "language_embed_tokens" in name:
+            name = name.replace("language_embed_tokens", "model.embed_tokens")
+            
+        # 2. 트랜스포머 레이어(몸통) 처리 (추가된 부분!)
+        if "language_layers" in name:
+            name = name.replace("language_layers", "model.layers")
+            
+        # 3. 정규화 레이어(Norm) 처리 (혹시 몰라 미리 추가)
+        if "language_norm" in name:
+            name = name.replace("language_norm", "model.norm")
+        # ▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲
+
+        # Stacked Parameter 처리 (QKV 등)
         for param_name, weight_name, shard_id in stacked_params_mapping:
             if weight_name not in name:
                 continue
-            name = name.replace(weight_name, param_name)
-            # Skip loading extra bias for GPTQ models.
-            if name.endswith(".bias") and name not in params_dict:
+
+            replaced_name = name.replace(weight_name, param_name)
+
+            # 🔥 Vision-specific correction for stacked mapping
+            if replaced_name.endswith(".bias") and replaced_name not in params_dict:
                 continue
-            local_loaded_weight = redistribute_dtensor(param_name=name, loaded_weights=loaded_weight)
-            param = params_dict[name]
+
+            local_loaded_weight = redistribute_dtensor(param_name=replaced_name,
+                                                       loaded_weights=loaded_weight)
+
+            if replaced_name not in params_dict:
+                # 여기서 에러가 나면, 위쪽의 전처리(name.replace)가 제대로 안 된 것입니다.
+                raise KeyError(f"Key '{replaced_name}' not in vLLM params. (Original: {name})")
+
+            param = params_dict[replaced_name]
             weight_loader = param.weight_loader
             weight_loader(param, local_loaded_weight.to(dtype=param.dtype), shard_id)
             break
+
         else:
-            # Skip loading extra bias for GPTQ models.
             if name.endswith(".bias") and name not in params_dict:
                 continue
+
+            if name not in params_dict:
+                raise KeyError(f"Key '{name}' not found in vLLM model parameters.")
+
             param = params_dict[name]
-            local_loaded_weight = redistribute_dtensor(param_name=name, loaded_weights=loaded_weight)
+            local_loaded_weight = redistribute_dtensor(param_name=name,
+                                                       loaded_weights=loaded_weight)
             weight_loader = getattr(param, "weight_loader", default_weight_loader)
             weight_loader(param, local_loaded_weight.to(dtype=param.dtype))
+
+# def qwen2vl_dtensor_weight_loader(actor_weights: Dict, vllm_model: nn.Module) -> nn.Module:
+
+#     # ▼▼▼ [HPT Patch] 함수 시작하자마자 키 이름 전처리 (Pre-processing) ▼▼▼
+#     # actor_weights의 키가 'model.visual'로 시작하면 'visual'로 바꿔치기한 새 딕셔너리를 만듭니다.
+#     sanitized_weights = {}
+#     for name, weight in actor_weights.items():
+#         # 1. 접두사 정리 (model.visual -> visual, model. -> "")
+#         if name.startswith("model.visual."):
+#             new_name = name.replace("model.visual.", "visual.")
+#         elif name.startswith("model."):
+#             new_name = name.replace("model.", "")
+#         else:
+#             new_name = name
+
+#         # 2. [추가] MLP 레이어 이름 매핑 (gate_up_proj -> fc1, down_proj -> fc2)
+#         # 주의: Qwen2.5-VL의 Vision Tower 내부만 해당됩니다. ('visual'이 포함된 경우)
+#         if "visual" in new_name:
+#             if "mlp.gate_up_proj" in new_name:
+#                 new_name = new_name.replace("mlp.gate_up_proj", "mlp.fc1")
+#             elif "mlp.down_proj" in new_name:
+#                 new_name = new_name.replace("mlp.down_proj", "mlp.fc2")
+        
+#         sanitized_weights[new_name] = weight
+    
+#     actor_weights = sanitized_weights
+#     # ▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲
+
+#     stacked_params_mapping = [
+#         # (param_name, shard_name, shard_id)
+#         ("qkv_proj", "q_proj", "q"),
+#         ("qkv_proj", "k_proj", "k"),
+#         ("qkv_proj", "v_proj", "v"),
+#         ("gate_up_proj", "gate_proj", 0),
+#         ("gate_up_proj", "up_proj", 1),
+#     ]
+#     params_dict = dict(vllm_model.named_parameters(remove_duplicate=False))
+#     # ▼▼▼ [수정된 디버깅 코드] MLP 관련 키 찾기 ▼▼▼
+#     print("\n🔥🔥🔥 [HPT Debug] Inspecting vLLM Model Parameters (MLP Focus) 🔥🔥🔥")
+#     all_keys = list(params_dict.keys())
+    
+#     # 'visual'과 'mlp'가 동시에 들어간 키를 찾습니다.
+#     mlp_keys = [k for k in all_keys if "visual" in k and "mlp" in k]
+    
+#     print(f"Total MLP keys found: {len(mlp_keys)}")
+#     if len(mlp_keys) > 0:
+#         print(f"MLP keys sample (first 5): {mlp_keys[:5]}")  # <--- 이게 필요합니다!
+#     else:
+#         print("⚠️ No 'mlp' keys found in visual blocks! Checking 'fc' keys...")
+#         fc_keys = [k for k in all_keys if "visual" in k and "fc" in k]
+#         print(f"FC keys sample: {fc_keys[:5]}")
+
+#     print("🔥🔥🔥 [End Debug] 🔥🔥🔥\n")
+#     # ▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲
+#     for name, loaded_weight in actor_weights.items():
+#         if "rotary_emb.inv_freq" in name:
+#             continue
+#         if vllm_model.config.tie_word_embeddings and "lm_head.weight" in name:
+#             continue
+#         for param_name, weight_name, shard_id in stacked_params_mapping:
+#             if weight_name not in name:
+#                 continue
+#             name = name.replace(weight_name, param_name)
+#             # Skip loading extra bias for GPTQ models.
+#             if name.endswith(".bias") and name not in params_dict:
+#                 continue
+#             local_loaded_weight = redistribute_dtensor(param_name=name, loaded_weights=loaded_weight)
+#             param = params_dict[name]
+#             weight_loader = param.weight_loader
+#             weight_loader(param, local_loaded_weight.to(dtype=param.dtype), shard_id)
+#             break
+#         else:
+#             # Skip loading extra bias for GPTQ models.
+#             if name.endswith(".bias") and name not in params_dict:
+#                 continue
+
+#             # [추가 디버깅] 수정
+#             # ▼▼▼ [디버깅 추가] vLLM이 가진 실제 키 확인 ▼▼▼
+#             if name not in params_dict:
+#                 # visual 관련 키만 뽑아서 출력해 봅니다.
+#                 visual_keys = [k for k in params_dict.keys() if "visual" in k]
+#                 print(f"❌ [HPT Error] '{name}' not found.")
+#                 print(f"🔍 [Debug] Available 'visual' keys in vLLM (first 10): {visual_keys[:10]}")
+                
+#             if name not in params_dict:
+#                 # print(f"❌ [HPT Error] Key '{name}' not found in vLLM params_dict. Available keys sample: {list(params_dict.keys())[:5]}")
+#                 raise KeyError(f"Key '{name}' not found in vLLM model parameters.")
+#             #//
+            
+#             param = params_dict[name]
+#             local_loaded_weight = redistribute_dtensor(param_name=name, loaded_weights=loaded_weight)
+#             weight_loader = getattr(param, "weight_loader", default_weight_loader)
+#             weight_loader(param, local_loaded_weight.to(dtype=param.dtype))
 
 
 from vllm.model_executor.layers.fused_moe import FusedMoE

@@ -155,20 +155,36 @@ def main(config):
 @ray.remote
 def main_task(config):
     from verl.utils.fs import copy_local_path_from_hdfs
+    from verl.utils import hf_tokenizer, hf_processor #수정 추가
     from transformers import AutoTokenizer
+    import pandas as pd  # 데이터 파일을 읽기 위해 pandas 필요
+    import os
+
+    local_path = copy_local_path_from_hdfs(config.actor_rollout_ref.model.path)
 
     # print initial config
+    tokenizer = hf_tokenizer(local_path) #수정추가
     from pprint import pprint
     from omegaconf import OmegaConf
+    processor = hf_processor(local_path, use_fast=True) #수정추가
     pprint(OmegaConf.to_container(config, resolve=True))  # resolve=True will eval symbol values
     OmegaConf.resolve(config)
+    
+    # ==================================================================
+    # [수정 추가] Chat Template 강제 주입 (Qwen2.5 ChatML 형식)
+    # ==================================================================
+    if not tokenizer.chat_template:
+        print("Warning: tokenizer.chat_template is missing. Setting Qwen2.5 ChatML template manually.")
+        # Qwen 공식 ChatML 템플릿
+        tokenizer.chat_template = "{% for message in messages %}{{'<|im_start|>' + message['role'] + '\n' + message['content'] + '<|im_end|>' + '\n'}}{% endfor %}{% if add_generation_prompt %}{{ '<|im_start|>assistant\n' }}{% endif %}"
+    # ==================================================================
 
     # download the checkpoint from hdfs
-    local_path = copy_local_path_from_hdfs(config.actor_rollout_ref.model.path)
+    
 
     # instantiate tokenizer
     from verl.utils import hf_tokenizer
-    tokenizer = hf_tokenizer(local_path)
+    #tokenizer = hf_tokenizer(local_path)
 
     # define worker classes
     if config.actor_rollout_ref.actor.strategy == 'fsdp':
@@ -232,10 +248,35 @@ def main_task(config):
         role_worker_mapping[Role.RewardModel] = ray.remote(RewardModelWorker)
         mapping[Role.RewardModel] = global_pool_id
 
-    reward_fn = RewardManager(tokenizer=tokenizer, num_examine=0, reward_impl_version=config.data.reward_impl_version)
+    #코드 수정 리워드 함수
+    # 1. RAG용 리워드 매니저 클래스 임포트
+    from verl.mix_src.lns_rm_phase1 import RagRewardManagerPhase1, RagEvalManagerPhase1
+    from verl.mix_src.lns_rm_phase2 import RagRewardManagerPhase2, RagEvalManagerPhase2
 
-    # Note that we always use function-based RM for validation
-    val_reward_fn = RewardManager(tokenizer=tokenizer, num_examine=1, reward_impl_version=config.data.reward_impl_version)
+    if config.data.reward_impl_version == 7:
+        print(f"[HPT] Using RAG Reward Manager Phase1")
+        
+        reward_fn = RagRewardManagerPhase1(tokenizer=tokenizer, num_examine=1)
+        
+        val_reward_fn = RagEvalManagerPhase1(tokenizer=tokenizer, num_examine=1)
+
+    elif config.data.reward_impl_version == 8:
+        print(f"[HPT] Using RAG Reward Manager Phase 2 ")
+
+        reward_fn = RagRewardManagerPhase2(tokenizer=tokenizer, num_examine=1)
+
+        val_reward_fn = RagEvalManagerPhase2(tokenizer=tokenizer, num_examine=1)        
+    else:
+        # 기존 로직 유지 (수학 문제 등 다른 태스크용)
+        reward_fn = RewardManager(tokenizer=tokenizer, num_examine=0, reward_impl_version=config.data.reward_impl_version)
+        val_reward_fn = RewardManager(tokenizer=tokenizer, num_examine=1, reward_impl_version=config.data.reward_impl_version)
+
+    #기존 코드
+    # reward_fn = RewardManager(tokenizer=tokenizer, num_examine=0, reward_impl_version=config.data.reward_impl_version)
+
+    # # Note that we always use function-based RM for validation
+    # val_reward_fn = RewardManager(tokenizer=tokenizer, num_examine=1, reward_impl_version=config.data.reward_impl_version)
+    #####
 
     resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=mapping)
 
@@ -243,6 +284,7 @@ def main_task(config):
     if not config.trainer.acc_rebatch:
         trainer = MIXRayPPOTrainer(config=config,
                                 tokenizer=tokenizer,
+                                processor=processor,
                                 role_worker_mapping=role_worker_mapping,
                                 resource_pool_manager=resource_pool_manager,
                                 ray_worker_group_cls=ray_worker_group_cls,

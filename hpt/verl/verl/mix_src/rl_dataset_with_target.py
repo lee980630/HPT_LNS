@@ -128,6 +128,7 @@ class RLHFDatasetWithTarget(RLHFDataset):
         row_dict['input_ids'] = input_ids[0]
         row_dict['attention_mask'] = attention_mask[0]
         row_dict['position_ids'] = position_ids[0]
+        row_dict['raw_prompt_ids'] = self.tokenizer.encode(prompt_with_chat_template, add_special_tokens=False) #수정 
         
         tgt = row_dict.pop(self.target_key)
         sample = np.random.rand() < self.sample_target_ratio

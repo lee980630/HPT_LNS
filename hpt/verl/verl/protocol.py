@@ -593,6 +593,14 @@ class DataProto:
             non_tensor_batch=repeated_non_tensor_batch,
             meta_info=self.meta_info,
         )
+    #vrag 수정 추가
+    def repeat_deepcopy(self, repeat_times, interleave=True):
+            import copy
+            # 1. 객체 전체를 깊은 복사 (원본 데이터 보존)
+            new_data_proto = copy.deepcopy(self)
+            # 2. 복사된 객체를 기반으로 repeat 수행
+            return new_data_proto.repeat(repeat_times=repeat_times, interleave=interleave)    
+    #/
     
     def slice(self, index):
         tensor_data = self.batch[index]
