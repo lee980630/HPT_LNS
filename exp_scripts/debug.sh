@@ -27,7 +27,7 @@ set -x
 DATE=$(date +%m%d)
 TIME_TAG=$(date +%H:%M)
 #vrag config 추가
-SEARCH_URL="http://163.239.28.21:5002/search"
+SEARCH_URL="***"
 MAX_TURNS=5
 #
 export PYTHONPATH=$ROOT:$PYTHONPATH
